@@ -3,7 +3,7 @@
 nodriver handles anti-detection natively. We just need to:
 1. Open signup page
 2. Fill form
-3. Wait for OTP (via catchmail.io)
+3. Wait for OTP (via catchmail.io or generator.email)
 4. Verify OTP
 5. Create API key
 """
@@ -382,8 +382,26 @@ class BlackboxClient:
             await self.signup(email, password)
 
             print(f"    Waiting for OTP...")
-            from providers.tempmail import wait_for_otp
-            code = await wait_for_otp(email, self._cfg)
+            code = None
+
+            if self._cfg.email_mode == "generator":
+                # generator.email mode — open in a browser tab
+                from providers.generator_email import GeneratorEmailClient
+                gen = GeneratorEmailClient(self._browser)
+                # We already have the email from signup, so just open inbox
+                gen._email = email.split("@")[0]
+                gen._domain = email.split("@")[1]
+                gen._tab = await self._browser.get(
+                    f"https://generator.email/{gen._domain}/{gen._email}"
+                )
+                await gen._tab.sleep(3)
+                code = await gen.wait_for_otp(self._cfg)
+                await gen.close()
+            else:
+                # catchmail.io mode — API-based
+                from providers.tempmail import wait_for_otp
+                code = await wait_for_otp(email, self._cfg)
+
             if not code:
                 raise BlackboxError(f"OTP not received within {self._cfg.verify_poll_timeout}s")
 

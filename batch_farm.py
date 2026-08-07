@@ -6,6 +6,11 @@ Batch-based concurrency:
   3. Wait for ALL to finish
   4. If more remain → random cooldown 10-20s
   5. Repeat until done
+
+Usage:
+  python batch_farm.py 20                     # 20 accounts, catchmail (default)
+  python batch_farm.py 20 catchmail           # same
+  python batch_farm.py 20 generator           # generator.email mode
 """
 import asyncio
 import os
@@ -23,7 +28,7 @@ from config import Config
 from anti_detect import AntiDetect
 from injector import inject_key, count_blackbox
 from providers.blackbox import BlackboxClient, AccountResult
-from providers.tempmail import generate_email
+from providers.tempmail import generate_email as gen_catchmail
 
 
 def generate_password(length=16):
@@ -33,22 +38,47 @@ def generate_password(length=16):
 async def _farm_one(idx: int, cfg: Config, results: list):
     """Farm a single account."""
     ad = AntiDetect(debug=False)
-    email = generate_email(cfg.tempmail_domain)
-    password = generate_password()
 
-    print(f"    [{idx:02d}] Starting: {email}")
-    client = BlackboxClient(cfg, anti_detect=ad)
-    result = None
-    try:
-        await client.start()
-        result = await client.register_account(email, password)
-    except Exception as e:
-        result = AccountResult(email=email, password=password, error=str(e)[:200])
-    finally:
+    if cfg.email_mode == "generator":
+        # For generator.email, we need a browser to get the email first
+        # then use it in the signup flow
+        from providers.generator_email import GeneratorEmailClient
+        client = BlackboxClient(cfg, anti_detect=ad)
         try:
-            await client.stop()
-        except:
-            pass
+            await client.start()
+            gen = GeneratorEmailClient(client._browser)
+            email = await gen.open()
+            password = generate_password()
+            await gen.close()
+
+            print(f"    [{idx:02d}] Starting: {email}")
+            result = await client.register_account(email, password)
+        except Exception as e:
+            email = f"unknown-{idx}@generator.email"
+            result = AccountResult(email=email, error=str(e)[:200])
+        finally:
+            try:
+                await client.stop()
+            except:
+                pass
+    else:
+        # catchmail mode
+        email = gen_catchmail(cfg.tempmail_domain)
+        password = generate_password()
+
+        print(f"    [{idx:02d}] Starting: {email}")
+        client = BlackboxClient(cfg, anti_detect=ad)
+        result = None
+        try:
+            await client.start()
+            result = await client.register_account(email, password)
+        except Exception as e:
+            result = AccountResult(email=email, password=password, error=str(e)[:200])
+        finally:
+            try:
+                await client.stop()
+            except:
+                pass
 
     results.append(result)
 
@@ -68,9 +98,11 @@ async def _farm_one(idx: int, cfg: Config, results: list):
 
 async def main():
     N = int(sys.argv[1]) if len(sys.argv) > 1 else 20
+    email_mode = sys.argv[2] if len(sys.argv) > 2 else "catchmail"
 
     print("=" * 60)
     print(f"BOXFARMER — BATCH FARM ({N} accounts)")
+    print(f"Email mode:  {email_mode}")
     print(f"Concurrency: random 1-3 per batch")
     print(f"Cooldown:    random 10-20s between batches")
     print("=" * 60)
@@ -80,7 +112,7 @@ async def main():
     print(f"  Current 9Router blackbox: {current}")
     print()
 
-    cfg = Config(headless=True)
+    cfg = Config(headless=True, email_mode=email_mode)
     Path("output").mkdir(exist_ok=True)
 
     success = 0
@@ -141,6 +173,7 @@ async def main():
     summary = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "target": N,
+        "email_mode": email_mode,
         "success": success,
         "failed": fail,
         "keys_file": keys_count,

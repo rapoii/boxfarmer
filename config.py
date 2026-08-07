@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 class Config:
     """Static run configuration."""
     blackbox_url: str = "https://app.blackbox.ai"
+    email_mode: str = "catchmail"  # "catchmail" or "generator"
     tempmail_domain: str = "catchmail.io"
     max_workers: int = 3
     verify_poll_timeout: int = 90
