@@ -41,7 +41,6 @@ async def _farm_one(idx: int, cfg: Config, results: list):
 
     if cfg.email_mode == "generator":
         # For generator.email, we need a browser to get the email first
-        # then use it in the signup flow
         from providers.generator_email import GeneratorEmailClient
         client = BlackboxClient(cfg, anti_detect=ad)
         try:
@@ -49,10 +48,10 @@ async def _farm_one(idx: int, cfg: Config, results: list):
             gen = GeneratorEmailClient(client._browser)
             email = await gen.open()
             password = generate_password()
-            await gen.close()
-
-            print(f"    [{idx:02d}] Starting: {email}")
-            result = await client.register_account(email, password)
+            # Save generator cookies for OTP polling
+            generator_cookies = gen._cookies.copy()
+            print(f"    [{idx:02d}] Starting: {email} (cookies: {len(generator_cookies)})")
+            result = await client.register_account(email, password, generator_cookies=generator_cookies)
         except Exception as e:
             email = f"unknown-{idx}@generator.email"
             result = AccountResult(email=email, error=str(e)[:200])

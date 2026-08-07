@@ -1,27 +1,28 @@
-"""Temp email via generator.email using a nodriver browser tab.
+"""Temp email via generator.email — hybrid browser + httpx approach.
 
-How it works:
-1. Open generator.email in a new tab
-2. Read the auto-generated email from the page
-3. Poll the inbox (same tab) for OTP messages
-4. Extract 6-digit code from email body
+Flow:
+1. Open generator.email in browser → get random email + session cookies
+2. Save cookies for httpx polling
+3. Poll inbox via HTTP with saved cookies (no browser tab needed)
+4. Fetch message source to extract OTP code
 
 Advantages over catchmail.io:
-- More domains available (less likely to be blocked)
-- Browser-based, looks like real user
-- No API key needed
+- More domains available (less likely to be blocked by Blackbox)
+- Browser-based (looks like real user)
 
 Disadvantages:
-- Requires a browser tab (can't use concurrently in same browser)
+- Requires browser session for initial setup (cookies)
 - May hit CAPTCHA on heavy use
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 from typing import Optional
 
+import httpx
 import nodriver as uc
 
 from config import Config
@@ -30,13 +31,14 @@ _OTP_PATTERN = re.compile(r"\b(\d{6})\b")
 
 
 class GeneratorEmailClient:
-    """Manages a generator.email session via nodriver."""
+    """Manages a generator.email session — browser for setup, httpx for polling."""
 
     def __init__(self, browser: uc.Browser):
         self._browser = browser
         self._tab: Optional[uc.Tab] = None
         self._email: str = ""
         self._domain: str = ""
+        self._cookies: dict = {}
 
     async def open(self) -> str:
         """Open generator.email and get a fresh random email address."""
@@ -46,128 +48,115 @@ class GeneratorEmailClient:
         # Read username from input#userName
         self._email = await self._tab.evaluate(
             '(function() { var el = document.getElementById("userName"); return el ? el.value : ""; })()'
-        )
+        ) or ""
         self._domain = await self._tab.evaluate(
             '(function() { var el = document.getElementById("domainName2") || document.getElementById("domainName"); return el ? el.value : ""; })()'
-        )
-
-        if not self._email or not self._domain:
-            # Fallback: parse from page
-            full = await self._tab.evaluate(
-                '(function() { var el = document.getElementById("mail"); return el ? el.value : ""; })()'
-            )
-            if full and "@" in full:
-                self._email, self._domain = full.split("@", 1)
+        ) or ""
 
         if not self._email or not self._domain:
             raise RuntimeError("Failed to read email from generator.email")
+
+        # Extract cookies from browser session for httpx polling
+        try:
+            cookies_raw = await self._tab.evaluate(
+                'document.cookie'
+            )
+            if cookies_raw:
+                for pair in cookies_raw.split(";"):
+                    pair = pair.strip()
+                    if "=" in pair:
+                        k, v = pair.split("=", 1)
+                        self._cookies[k.strip()] = v.strip()
+        except:
+            pass
 
         full_email = f"{self._email}@{self._domain}"
         print(f"  [generator.email] {full_email}")
         return full_email
 
     async def wait_for_otp(self, cfg: Config) -> Optional[str]:
-        """Poll inbox for OTP code."""
-        if not self._tab:
-            raise RuntimeError("Tab not opened")
-
+        """Poll generator.email inbox for OTP code via HTTP."""
         deadline = time.monotonic() + cfg.verify_poll_timeout
         poll_count = 0
+        seen_ids = set()
 
-        while True:
-            poll_count += 1
+        base_url = f"https://generator.email/{self._domain}/{self._email}"
 
-            # Click "Refresh" or poll inbox via JS
-            try:
-                # generator.email uses SSE/polling, but let's also click refresh if available
-                await self._tab.evaluate(
-                    '(function() { var btn = document.querySelector("#refresh_but, button[onclick*=refresh], .refresh-btn"); if(btn) btn.click(); })()'
-                )
-            except:
-                pass
+        async with httpx.AsyncClient(
+            timeout=cfg.request_timeout,
+            follow_redirects=True,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Referer": "https://generator.email/",
+            },
+            cookies=self._cookies,
+        ) as client:
+            while True:
+                poll_count += 1
 
-            await self._tab.sleep(2)
+                try:
+                    # Fetch inbox page
+                    resp = await client.get(base_url)
+                    if resp.status_code == 200:
+                        html = resp.text
 
-            # Check for new messages in the inbox area
-            try:
-                message_count = await self._tab.evaluate(
-                    '(function() { return document.querySelectorAll("#email-table tr, .email-item, .mail_item, .inbox-item, .mess_item").length; })()'
-                )
+                        # Extract message IDs from the page
+                        # generator.email embeds message IDs in various ways
+                        message_ids = re.findall(r'data-mid="([^"]+)"', html)
+                        if not message_ids:
+                            message_ids = re.findall(r"mess_id\s*[:=]\s*['\"]([^'\"]+)['\"]", html)
+                        if not message_ids:
+                            # Try to find onclick handlers with message IDs
+                            message_ids = re.findall(r"showMail\(['\"]([^'\"]+)['\"]\)", html)
+                        if not message_ids:
+                            message_ids = re.findall(r'src=([^&"]+)', html)
 
-                if message_count and int(message_count) > 0:
-                    # Try to read the first message
-                    otp = await self._read_latest_otp()
-                    if otp:
-                        return otp
+                        new_ids = [mid for mid in message_ids if mid not in seen_ids]
 
-                    # Click on the first message to open it
-                    try:
-                        await self._tab.evaluate(
-                            '(function() { var row = document.querySelector("#email-table tr, .email-item, .mail_item, .inbox-item, .mess_item"); if(row) row.click(); })()'
-                        )
-                        await self._tab.sleep(2)
-                        otp = await self._read_latest_otp()
-                        if otp:
-                            return otp
-                    except:
-                        pass
+                        if new_ids:
+                            for mid in new_ids:
+                                seen_ids.add(mid)
+                                # Fetch message source
+                                try:
+                                    src_resp = await client.get(
+                                        base_url,
+                                        params={"src": mid},
+                                    )
+                                    if src_resp.status_code == 200:
+                                        body = src_resp.text
+                                        # Strip HTML tags
+                                        text = re.sub(r'<[^>]+>', ' ', body)
+                                        if "blackbox" in text.lower() or "verify" in text.lower() or "code" in text.lower():
+                                            match = _OTP_PATTERN.search(text)
+                                            if match:
+                                                code = match.group(1)
+                                                print(f"  [generator.email] OTP found: {code}")
+                                                return code
+                                except:
+                                    continue
 
-            except:
-                pass
+                        # Also check if there's a direct code in the page
+                        if "blackbox" in html.lower() or "verify" in html.lower():
+                            text = re.sub(r'<[^>]+>', ' ', html)
+                            match = _OTP_PATTERN.search(text)
+                            if match:
+                                code = match.group(1)
+                                print(f"  [generator.email] OTP found (direct): {code}")
+                                return code
 
-            # Also check full page text for OTP
-            try:
-                page_text = await self._tab.evaluate("document.body.innerText") or ""
-                # Only look for OTP if there's a blackbox-related message
-                if "blackbox" in page_text.lower() or "verify" in page_text.lower() or "code" in page_text.lower():
-                    match = _OTP_PATTERN.search(page_text)
-                    if match:
-                        code = match.group(1)
-                        print(f"  [generator.email] OTP found: {code}")
-                        return code
-            except:
-                pass
+                except Exception as e:
+                    if poll_count % 10 == 0:
+                        print(f"  [generator.email] Poll error: {e}")
 
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
 
-            if poll_count % 5 == 0:
-                print(f"  [generator.email] Polling... ({poll_count})")
+                if poll_count % 5 == 0:
+                    print(f"  [generator.email] Polling... ({poll_count})")
 
-            await asyncio.sleep(min(cfg.verify_poll_interval, remaining))
-
-    async def _read_latest_otp(self) -> Optional[str]:
-        """Try to extract OTP from visible message content."""
-        try:
-            # Get message body text
-            body_text = await self._tab.evaluate(
-                '(function() { '
-                '  var el = document.querySelector("#email-body, .email-body, .mail-body, .message-body, .mess_body, .source-body"); '
-                '  return el ? el.innerText : ""; '
-                '})()'
-            )
-            if body_text:
-                match = _OTP_PATTERN.search(body_text)
-                if match:
-                    return match.group(1)
-
-            # Try innerHTML for hidden elements
-            body_html = await self._tab.evaluate(
-                '(function() { '
-                '  var el = document.querySelector("#email-body, .email-body, .mail-body, .message-body, .mess_body, .source-body"); '
-                '  return el ? el.innerHTML : ""; '
-                '})()'
-            )
-            if body_html:
-                # Strip tags
-                text = re.sub(r'<[^>]+>', ' ', body_html)
-                match = _OTP_PATTERN.search(text)
-                if match:
-                    return match.group(1)
-        except:
-            pass
-        return None
+                await asyncio.sleep(min(cfg.verify_poll_interval, remaining))
 
     async def close(self):
         """Close the tab."""

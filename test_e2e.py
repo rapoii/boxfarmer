@@ -31,10 +31,10 @@ async def test():
     print("[1/5] AntiDetect init...")
     ad = AntiDetect(debug=False)
     print(f"  [antidetect] Session: {ad.session_id}")
-    print(f"  [antidetect] GPU: {ad.profile['vendor']} {ad.profile['renderer']}")
-    print(f"  [antidetect] Platform: {ad.profile['platform']}, Cores: {ad.profile['cores']}, RAM: {ad.profile['ram']}GB")
-    print(f"  [antidetect] TZ: {ad.profile['tz']}, Locale: {ad.profile['locale']}")
-    print(f"  [antidetect] Screen: {ad.profile['screen_w']}x{ad.profile['screen_h']}, DPR: {ad.profile['dpr']}")
+    print(f"  [antidetect] GPU: {ad.vendor} {ad.renderer}")
+    print(f"  [antidetect] Platform: {ad.platform}, Cores: {ad.cores}, RAM: {ad.memory}GB")
+    print(f"  [antidetect] TZ: {ad.timezone}, Locale: {ad.locale}")
+    print(f"  [antidetect] Screen: {ad.screen_w}x{ad.screen_h}, DPR: {ad.dpr}")
     print()
 
     # [2/5] Config
@@ -44,35 +44,33 @@ async def test():
     print(f"  ✓ email_mode={cfg.email_mode}")
     print()
 
+    from providers.blackbox import BlackboxClient
+
     # [3/5] Generate email
     print("[3/5] Generate email...")
+    client = BlackboxClient(cfg, anti_detect=ad)
+    await client.start()
+
+    generator_cookies = {}
     if email_mode == "generator":
         from providers.generator_email import GeneratorEmailClient
-        from providers.blackbox import BlackboxClient
-        # Need browser first to get email
-        tmp_client = BlackboxClient(cfg, anti_detect=ad)
-        await tmp_client.start()
-        gen = GeneratorEmailClient(tmp_client._browser)
+        gen = GeneratorEmailClient(client._browser)
         email = await gen.open()
         password = "BoxfarmerTest2026!"
-        await gen.close()
-        print(f"  ✓ Email: {email}")
-        print()
-        print("[4/5] Register account (nodriver)...")
-        result = await tmp_client.register_account(email, password)
-        await tmp_client.stop()
+        # Save cookies from generator.email session
+        generator_cookies = gen._cookies.copy()
+        print(f"  ✓ Email: {email} (cookies: {len(generator_cookies)})")
     else:
         from providers.tempmail import generate_email
         email = generate_email(cfg.tempmail_domain)
         password = "BoxfarmerTest2026!"
         print(f"  ✓ Email: {email}")
-        print()
-        print("[4/5] Register account (nodriver)...")
-        from providers.blackbox import BlackboxClient
-        client = BlackboxClient(cfg, anti_detect=ad)
-        await client.start()
-        result = await client.register_account(email, password)
-        await client.stop()
+    print()
+
+    # [4/5] Register account
+    print("[4/5] Register account (nodriver)...")
+    result = await client.register_account(email, password, generator_cookies=generator_cookies)
+    await client.stop()
     print()
 
     if not result.success:

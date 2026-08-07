@@ -372,8 +372,14 @@ class BlackboxClient:
 
         raise BlackboxError("API key not found after creation")
 
-    async def register_account(self, email: str, password: str) -> AccountResult:
-        """Full registration flow: signup → OTP → verify → create key."""
+    async def register_account(self, email: str, password: str, generator_cookies: Optional[dict] = None) -> AccountResult:
+        """Full registration flow: signup → OTP → verify → create key.
+        
+        Args:
+            email: Email address to register with
+            password: Password for the account
+            generator_cookies: Cookies from generator.email session (for generator mode)
+        """
         result = AccountResult(email=email, password=password)
         start = time.monotonic()
 
@@ -385,18 +391,13 @@ class BlackboxClient:
             code = None
 
             if self._cfg.email_mode == "generator":
-                # generator.email mode — open in a browser tab
+                # generator.email mode — poll via HTTP with saved cookies
                 from providers.generator_email import GeneratorEmailClient
                 gen = GeneratorEmailClient(self._browser)
-                # We already have the email from signup, so just open inbox
                 gen._email = email.split("@")[0]
                 gen._domain = email.split("@")[1]
-                gen._tab = await self._browser.get(
-                    f"https://generator.email/{gen._domain}/{gen._email}"
-                )
-                await gen._tab.sleep(3)
+                gen._cookies = generator_cookies or {}
                 code = await gen.wait_for_otp(self._cfg)
-                await gen.close()
             else:
                 # catchmail.io mode — API-based
                 from providers.tempmail import wait_for_otp
