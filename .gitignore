@@ -1,0 +1,8 @@
+# Sensitive output — DO NOT commit
+output/keys.txt
+output/batch_summary.json
+output/debug_*.png
+output/state.json
+.env
+__pycache__/
+*.pyc
