@@ -1,8 +1,18 @@
-"""Batch farm — register N accounts and inject to 9Router."""
+"""Batch farm — register N accounts and inject to 9Router.
+
+Batch-based concurrency:
+  1. Random pick 1-3 accounts per batch
+  2. Run them concurrently
+  3. Wait for ALL to finish
+  4. If more remain → random cooldown 10-20s
+  5. Repeat until done
+"""
 import asyncio
 import os
 import secrets
 import string
+import sys
+import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,16 +30,49 @@ def generate_password(length=16):
     return "".join(secrets.choice(string.ascii_letters + string.digits + "!@#$%") for _ in range(length))
 
 
-async def main():
-    import json
-    import sys
+async def _farm_one(idx: int, cfg: Config, results: list):
+    """Farm a single account."""
+    ad = AntiDetect(debug=False)
+    email = generate_email(cfg.tempmail_domain)
+    password = generate_password()
 
+    print(f"    [{idx:02d}] Starting: {email}")
+    client = BlackboxClient(cfg, anti_detect=ad)
+    result = None
+    try:
+        await client.start()
+        result = await client.register_account(email, password)
+    except Exception as e:
+        result = AccountResult(email=email, password=password, error=str(e)[:200])
+    finally:
+        try:
+            await client.stop()
+        except:
+            pass
+
+    results.append(result)
+
+    if result.success:
+        with open("output/keys.txt", "a", encoding="utf-8") as f:
+            f.write(f"{email}:{password}:{result.api_key}\n")
+        try:
+            conn_id = inject_key(email, result.api_key)
+            print(f"    [{idx:02d}] [OK] -> 9Router: {conn_id}")
+        except Exception as e:
+            print(f"    [{idx:02d}] [OK] (inject fail: {e})")
+    else:
+        print(f"    [{idx:02d}] [FAIL] {result.error[:60]}")
+
+    return result
+
+
+async def main():
     N = int(sys.argv[1]) if len(sys.argv) > 1 else 20
-    CONCURRENCY = int(sys.argv[2]) if len(sys.argv) > 2 else 3
 
     print("=" * 60)
     print(f"BOXFARMER — BATCH FARM ({N} accounts)")
-    print(f"Concurrency: {CONCURRENCY}")
+    print(f"Concurrency: random 1-3 per batch")
+    print(f"Cooldown:    random 10-20s between batches")
     print("=" * 60)
     print()
 
@@ -37,64 +80,53 @@ async def main():
     print(f"  Current 9Router blackbox: {current}")
     print()
 
-    cfg = Config(max_workers=CONCURRENCY, headless=True)
+    cfg = Config(headless=True)
     Path("output").mkdir(exist_ok=True)
 
-    sem = asyncio.Semaphore(CONCURRENCY)
     success = 0
     fail = 0
     results = []
+    remaining = N
+    batch_num = 0
 
-    async def _run(idx):
-        nonlocal success, fail
-        async with sem:
-            ad = AntiDetect(debug=False)
-            email = generate_email(cfg.tempmail_domain)
-            password = generate_password()
+    while remaining > 0:
+        batch_num += 1
+        # Random batch size: 1-3
+        batch_size = secrets.randbelow(3) + 1
+        if batch_size > remaining:
+            batch_size = remaining
 
-            print(f"  [{idx:02d}] Starting: {email}")
-            client = BlackboxClient(cfg, anti_detect=ad)
-            try:
-                await client.start()
-                result = await client.register_account(email, password)
-            except Exception as e:
-                result = AccountResult(email=email, password=password, error=str(e)[:200])
-            finally:
-                try:
-                    await client.stop()
-                except:
-                    pass
+        print(f"  [BATCH {batch_num}] {batch_size} accounts (remaining: {remaining})")
 
-            results.append(result)
+        # Create tasks for this batch
+        batch_tasks = []
+        for i in range(batch_size):
+            idx = N - remaining + i + 1
+            batch_tasks.append(_farm_one(idx, cfg, results))
 
-            if result.success:
+        # Run all in this batch concurrently
+        await asyncio.gather(*batch_tasks, return_exceptions=True)
+
+        # Count results from this batch
+        for r in results[-batch_size:]:
+            if r and r.success:
                 success += 1
-                with open("output/keys.txt", "a", encoding="utf-8") as f:
-                    f.write(f"{email}:{password}:{result.api_key}\n")
-                try:
-                    conn_id = inject_key(email, result.api_key)
-                    print(f"  [{idx:02d}] [OK] -> 9Router: {conn_id}")
-                except Exception as e:
-                    print(f"  [{idx:02d}] [OK] (inject fail: {e})")
             else:
                 fail += 1
-                print(f"  [{idx:02d}] [FAIL] {result.error[:60]}")
 
-            done = success + fail
-            if done % 5 == 0 or done == N:
-                total_now = count_blackbox()
-                print(f"  [PROGRESS] {done}/{N} (OK:{success} FAIL:{fail}) | 9Router: {total_now}")
+        remaining -= batch_size
 
-    # Stagger launches
-    tasks = []
-    for i in range(N):
-        tasks.append(asyncio.create_task(_run(i + 1)))
-        if i < N - 1:
-            await asyncio.sleep(secrets.SystemRandom().uniform(*cfg.delay_range))
+        # Progress update
+        total_now = count_blackbox()
+        print(f"  [PROGRESS] {success + fail}/{N} (OK:{success} FAIL:{fail}) | 9Router: {total_now}")
 
-    await asyncio.gather(*tasks, return_exceptions=True)
+        # Cooldown if more remaining
+        if remaining > 0:
+            cooldown = secrets.randbelow(11) + 10  # 10-20s
+            print(f"  [COOLDOWN] {cooldown}s...")
+            await asyncio.sleep(cooldown)
 
-    # Final
+    # Final summary
     total_final = count_blackbox()
     keys_file = Path("output/keys.txt")
     keys_count = len(keys_file.read_text().strip().splitlines()) if keys_file.exists() else 0
@@ -113,6 +145,7 @@ async def main():
         "failed": fail,
         "keys_file": keys_count,
         "9router_total": total_final,
+        "batches": batch_num,
         "accounts": [
             {
                 "email": r.email,
