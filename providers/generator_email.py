@@ -8,6 +8,7 @@ Key DOM structure (MCP Playwright verified):
 - SITE_DATA: {cur_user, cur_domain, num_mess, mess_id_raw}
 - .mess_bodiyy: message body text
 - Regex: \\b(\\d{6})\\b to extract OTP
+- "Generate new e-mail" button: #genrandom (randomizes domain + username)
 """
 from __future__ import annotations
 
@@ -24,56 +25,68 @@ from config import Config
 class GeneratorEmailClient:
     """Manages a generator.email session via nodriver browser."""
 
+    # Domains that can't receive Blackbox emails
+    UNSUPPORTED_DOMAINS = {"generator.email", "dharmadi.com", "dharmadi"}
+
     def __init__(self, browser: uc.Browser):
         self._browser = browser
         self._tab: Optional[uc.Tab] = None
         self._email: str = ""
         self._domain: str = ""
 
-    async def open(self, preferred_domain: str = "senvas.me") -> str:
-        """Open generator.email inbox directly with preferred domain."""
-        import secrets
-        import string
+    async def open(self, preferred_domain: str = "") -> str:
+        """Open generator.email and get a fresh email address.
 
-        random_user = ''.join(
-            secrets.choice(string.ascii_lowercase + string.digits) for _ in range(10)
-        )
-        domain = preferred_domain or "senvas.me"
-        inbox_url = f"https://generator.email/{domain}/{random_user}"
-        self._tab = await self._browser.get(inbox_url)
-        await self._tab.sleep(5)
+        Two modes:
+        - preferred_domain="" (default): click "Generate new e-mail" to get
+          a random domain assigned by generator.email (recommended, avoids
+          domain-level rate limits).
+        - preferred_domain="example.com": navigate directly to that domain
+          inbox with a random username.
 
-        for attempt in range(3):
-            site_data = await self._tab.evaluate(
-                '(function() { var d = window.SITE_DATA || {}; '
-                'return { user: d.cur_user || "", domain: d.cur_domain || "" }; })()'
+        Returns the full email address (user@domain).
+        """
+        if preferred_domain:
+            import secrets
+            import string
+            random_user = ''.join(
+                secrets.choice(string.ascii_lowercase + string.digits) for _ in range(10)
             )
-            if site_data and isinstance(site_data, dict):
-                self._email = site_data.get("user", "")
-                self._domain = site_data.get("domain", "")
-                if self._email and self._domain:
-                    break
+            inbox_url = f"https://generator.email/{preferred_domain}/{random_user}"
+            self._tab = await self._browser.get(inbox_url)
+            await self._tab.sleep(5)
+            await self._read_email_from_page()
+        else:
+            # Random mode: let generator.email pick domain (like grok_farmer)
+            self._tab = await self._browser.get("https://generator.email")
+            await self._tab.sleep(5)
 
-            if not self._email:
-                self._email = await self._tab.evaluate(
-                    '(function() { var el = document.getElementById("userName"); '
-                    'return el ? el.value : ""; })()'
-                ) or ""
-            if not self._domain:
-                self._domain = await self._tab.evaluate(
-                    '(function() { var el = document.getElementById("domainName2") || '
-                    'document.getElementById("domainName"); return el ? el.value : ""; })()'
-                ) or ""
+            for gen_attempt in range(5):
+                # Reset for each attempt
+                self._email = ""
+                self._domain = ""
+                await self._read_email_from_page()
+
+                if self._email and self._domain:
+                    if self._domain not in self.UNSUPPORTED_DOMAINS:
+                        break
+                    print(f"  [generator.email] Domain {self._domain} unsupported, "
+                          f"regenerating... (attempt {gen_attempt+1})")
+                await self._click_generate()
+
+        # Final fallback: retry reading if empty
+        for attempt in range(3):
             if self._email and self._domain:
                 break
-
-            if attempt < 2:
-                print(f"  [generator.email] SITE_DATA empty, reload #{attempt+1}...")
-                try:
-                    await self._tab.evaluate("location.reload()")
-                    await self._tab.sleep(5)
-                except Exception:
-                    pass
+            print(f"  [generator.email] SITE_DATA empty, reload #{attempt+1}...")
+            try:
+                await self._tab.evaluate("location.reload()")
+                await self._tab.sleep(5)
+            except Exception:
+                pass
+            self._email = ""
+            self._domain = ""
+            await self._read_email_from_page()
 
         if not self._email or not self._domain:
             raise RuntimeError("Failed to read email from generator.email")
@@ -96,7 +109,6 @@ class GeneratorEmailClient:
         poll_count = 0
 
         try:
-            # Open a fresh new tab for inbox
             print(f"  [generator.email] Opening fresh inbox tab...")
             self._tab = await self._browser.get(inbox_url, new_tab=True)
             await self._tab.sleep(6)
@@ -104,24 +116,7 @@ class GeneratorEmailClient:
             while True:
                 poll_count += 1
 
-                # Check SITE_DATA for message count
-                try:
-                    result = await self._tab.evaluate(
-                        '(function() { '
-                        '  var d = window.SITE_DATA || {}; '
-                        '  return { '
-                        '    num_mess: parseInt(d.num_mess || 0, 10), '
-                        '    user: d.cur_user || "", '
-                        '    domain: d.cur_domain || "" '
-                        '  }; '
-                        '})()'
-                    )
-                except Exception:
-                    result = None
-
-                num_mess = 0
-                if result and isinstance(result, dict):
-                    num_mess = result.get("num_mess", 0)
+                num_mess = await self._check_num_mess(self._tab)
 
                 if num_mess > 0:
                     otp = await self._extract_otp(self._tab)
@@ -136,7 +131,6 @@ class GeneratorEmailClient:
                 if poll_count % 5 == 0:
                     print(f"  [generator.email] Poll #{poll_count} (messages: {num_mess})")
 
-                # Reload for next poll
                 try:
                     await self._tab.evaluate("location.reload()")
                     await self._tab.sleep(4)
@@ -180,23 +174,7 @@ class GeneratorEmailClient:
                     except Exception:
                         pass
 
-                try:
-                    result = await use_tab.evaluate(
-                        '(function() { '
-                        '  var d = window.SITE_DATA || {}; '
-                        '  return { '
-                        '    num_mess: parseInt(d.num_mess || 0, 10), '
-                        '    user: d.cur_user || "", '
-                        '    domain: d.cur_domain || "" '
-                        '  }; '
-                        '})()'
-                    )
-                except Exception:
-                    result = None
-
-                num_mess = 0
-                if result and isinstance(result, dict):
-                    num_mess = result.get("num_mess", 0)
+                num_mess = await self._check_num_mess(use_tab)
 
                 if num_mess > 0:
                     otp = await self._extract_otp(use_tab)
@@ -217,42 +195,92 @@ class GeneratorEmailClient:
             print(f"  [generator.email] Error: {e}")
             return None
 
-    async def _extract_otp(self, tab: uc.Tab) -> Optional[str]:
-        """Extract OTP from .mess_bodiyy element."""
+    async def _check_num_mess(self, tab: uc.Tab) -> int:
+        """Check SITE_DATA.num_mess on a tab. Returns 0 on failure."""
         try:
             result = await tab.evaluate(
                 '(function() { '
-                '  var bodiyy = document.querySelector(".mess_bodiyy"); '
-                '  if (!bodiyy) return null; '
-                '  var text = bodiyy.innerText || ""; '
-                '  if (!text) return null; '
-                '  var match = text.match(/\\b(\\d{6})\\b/); '
-                '  return match ? match[1] : null; '
+                '  var d = window.SITE_DATA || {}; '
+                '  return parseInt(d.num_mess || 0, 10); '
                 '})()'
             )
-            if result and len(str(result)) == 6:
-                code = str(result)
-                print(f"  [generator.email] OTP found: {code}")
-                return code
+            return int(result or 0)
+        except Exception:
+            return 0
 
-            result2 = await tab.evaluate(
-                '(function() { '
-                '  var body = document.getElementById("mail-summary-body"); '
-                '  if (!body) return null; '
-                '  var text = body.innerText || ""; '
-                '  if (!text) return null; '
-                '  var match = text.match(/\\b(\\d{6})\\b/); '
-                '  return match ? match[1] : null; '
-                '})()'
-            )
-            if result2 and len(str(result2)) == 6:
-                code = str(result2)
-                print(f"  [generator.email] OTP found (body): {code}")
-                return code
-
-        except Exception as e:
-            print(f"  [generator.email] extract error: {e}")
+    async def _extract_otp(self, tab: uc.Tab) -> Optional[str]:
+        """Extract 6-digit OTP from .mess_bodiyy or #mail-summary-body."""
+        for selector, label in [
+            (".mess_bodiyy", ""),
+            ("#mail-summary-body", " (body)"),
+        ]:
+            try:
+                result = await tab.evaluate(
+                    f'(function() {{ '
+                    f'  var el = document.querySelector("{selector}"); '
+                    f'  if (!el) return null; '
+                    f'  var text = el.innerText || ""; '
+                    f'  if (!text) return null; '
+                    f'  var match = text.match(/\\b(\\d{{6}})\\b/); '
+                    f'  return match ? match[1] : null; '
+                    f'}})()'
+                )
+                if result and len(str(result)) == 6:
+                    code = str(result)
+                    print(f"  [generator.email] OTP found{label}: {code}")
+                    return code
+            except Exception as e:
+                print(f"  [generator.email] extract error ({label.strip() or selector}): {e}")
         return None
+
+    async def _click_generate(self):
+        """Click 'Generate new e-mail' button (#genrandom)."""
+        try:
+            btn = await self._tab.select("#genrandom", timeout=3)
+            if btn:
+                await btn.click()
+                await self._tab.sleep(3)
+        except Exception:
+            try:
+                btn = await self._tab.find("Generate new e-mail", best_match=True, timeout=3)
+                if btn:
+                    await btn.click()
+                    await self._tab.sleep(3)
+            except Exception:
+                pass
+
+    async def _read_email_from_page(self):
+        """Read email username and domain from SITE_DATA or input fields."""
+        # Try SITE_DATA first (server-rendered, most reliable)
+        try:
+            site_data = await self._tab.evaluate(
+                '(function() { var d = window.SITE_DATA || {}; '
+                'return { user: d.cur_user || "", domain: d.cur_domain || "" }; })()'
+            )
+            if site_data and isinstance(site_data, dict):
+                self._email = site_data.get("user", "") or self._email
+                self._domain = site_data.get("domain", "") or self._domain
+        except Exception:
+            pass
+
+        # Fallback: read from input fields
+        if not self._email:
+            try:
+                self._email = await self._tab.evaluate(
+                    '(function() { var el = document.getElementById("userName"); '
+                    'return el ? el.value : ""; })()'
+                ) or self._email
+            except Exception:
+                pass
+
+        if not self._domain:
+            try:
+                self._domain = await self._tab.evaluate(
+                    '(function() { var el = document.getElementById("domainName2") || '
+                    'document.getElementById("domainName"); return el ? el.value : ""; })()'
+                ) or self._domain
+            except Exception:
+                pass
 
     async def close(self):
         if self._tab:
