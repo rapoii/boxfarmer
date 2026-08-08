@@ -25,9 +25,6 @@ from config import Config
 class GeneratorEmailClient:
     """Manages a generator.email session via nodriver browser."""
 
-    # Domains that can't receive Blackbox emails
-    UNSUPPORTED_DOMAINS = {"generator.email", "dharmadi.com", "dharmadi"}
-
     def __init__(self, browser: uc.Browser):
         self._browser = browser
         self._tab: Optional[uc.Tab] = None
@@ -39,8 +36,7 @@ class GeneratorEmailClient:
 
         Two modes:
         - preferred_domain="" (default): click "Generate new e-mail" to get
-          a random domain assigned by generator.email (recommended, avoids
-          domain-level rate limits).
+          a random domain assigned by generator.email (recommended).
         - preferred_domain="example.com": navigate directly to that domain
           inbox with a random username.
 
@@ -55,24 +51,11 @@ class GeneratorEmailClient:
             inbox_url = f"https://generator.email/{preferred_domain}/{random_user}"
             self._tab = await self._browser.get(inbox_url)
             await self._tab.sleep(5)
-            await self._read_email_from_page()
         else:
-            # Random mode: let generator.email pick domain (like grok_farmer)
+            # Random mode: let generator.email pick domain
             self._tab = await self._browser.get("https://generator.email")
             await self._tab.sleep(5)
-
-            for gen_attempt in range(5):
-                # Reset for each attempt
-                self._email = ""
-                self._domain = ""
-                await self._read_email_from_page()
-
-                if self._email and self._domain:
-                    if self._domain not in self.UNSUPPORTED_DOMAINS:
-                        break
-                    print(f"  [generator.email] Domain {self._domain} unsupported, "
-                          f"regenerating... (attempt {gen_attempt+1})")
-                await self._click_generate()
+            await self._click_generate()
 
         # Final fallback: retry reading if empty
         for attempt in range(3):
