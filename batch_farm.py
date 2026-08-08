@@ -46,12 +46,12 @@ async def _farm_one(idx: int, cfg: Config, results: list):
         try:
             await client.start()
             gen = GeneratorEmailClient(client._browser)
-            email = await gen.open()
+            email = await gen.open(preferred_domain=cfg.generator_preferred_domain)
+            # Set inbox tab as main tab — register_account navigates it to blackbox
+            client._tab = gen._tab
             password = generate_password()
-            # Save generator cookies for OTP polling
-            generator_cookies = gen._cookies.copy()
-            print(f"    [{idx:02d}] Starting: {email} (cookies: {len(generator_cookies)})")
-            result = await client.register_account(email, password, generator_cookies=generator_cookies)
+            print(f"    [{idx:02d}] Starting: {email}")
+            result = await client.register_account(email, password)
         except Exception as e:
             email = f"unknown-{idx}@generator.email"
             result = AccountResult(email=email, error=str(e)[:200])

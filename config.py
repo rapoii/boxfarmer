@@ -19,6 +19,7 @@ class Config:
     random_delay_min: float = 3.0
     random_delay_max: float = 10.0
     key_name: str = "auto-farm-key"
+    generator_preferred_domain: str = "senvas.me"  # proven to work with Blackbox
 
     @property
     def delay_range(self) -> tuple[float, float]:

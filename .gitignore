@@ -6,3 +6,8 @@ output/state.json
 .env
 __pycache__/
 *.pyc
+# Debug/test scripts (throwaway)
+test_debug.py
+test_debug2.py
+test_clean.py
+test_signup_debug.py

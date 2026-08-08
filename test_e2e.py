@@ -8,8 +8,6 @@ Usage:
 import asyncio
 import os
 import sys
-import time
-import traceback
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
@@ -51,15 +49,15 @@ async def test():
     client = BlackboxClient(cfg, anti_detect=ad)
     await client.start()
 
-    generator_cookies = {}
     if email_mode == "generator":
         from providers.generator_email import GeneratorEmailClient
         gen = GeneratorEmailClient(client._browser)
-        email = await gen.open()
+        email = await gen.open(preferred_domain=cfg.generator_preferred_domain)
+        # Set inbox tab as client's main tab — register_account will
+        # navigate it to blackbox, then open fresh tab for OTP check
+        client._tab = gen._tab
         password = "BoxfarmerTest2026!"
-        # Save cookies from generator.email session
-        generator_cookies = gen._cookies.copy()
-        print(f"  ✓ Email: {email} (cookies: {len(generator_cookies)})")
+        print(f"  ✓ Email: {email}")
     else:
         from providers.tempmail import generate_email
         email = generate_email(cfg.tempmail_domain)
@@ -69,7 +67,7 @@ async def test():
 
     # [4/5] Register account
     print("[4/5] Register account (nodriver)...")
-    result = await client.register_account(email, password, generator_cookies=generator_cookies)
+    result = await client.register_account(email, password)
     await client.stop()
     print()
 
